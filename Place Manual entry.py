@@ -1,0 +1,1083 @@
+# hft_bot_kite_local_complete_v2.py — modified
+# Key changes made:
+# - Use FIXED_POSITION_AMOUNT (env) to calculate qty per position when set; fallback to capital_per_position()
+# - Send Telegram notification every time a signal is fetched, but avoid duplicate notifications
+#   for the same (symbol, side) pair within SIGNAL_DEDUP_MINUTES (default 40 minutes).
+# - Telegram message now includes suggested qty, LTP and prev-candle trigger TS & value.
+# - Added sent_signals cache and housekeeping.
+
+import os
+import time
+import random, urllib.parse, ast
+import requests
+import threading
+import csv
+from datetime import datetime, timedelta
+from collections import defaultdict
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service as ChromeService
+from webdriver_manager.chrome import ChromeDriverManager
+import pytz
+import pandas as pd
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+load_dotenv()
+from kiteconnect import KiteConnect
+import platform
+
+# Prevent system sleep (Windows)
+if platform.system() == "Windows":
+    import ctypes
+    ES_CONTINUOUS = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+
+# ==================== Config ====================
+india_tz = pytz.timezone("Asia/Kolkata")
+SIMULATION_MODE = False
+DEBUG = True
+
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "1"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
+MAIN_SLEEP_MIN, MAIN_SLEEP_MAX = int(os.getenv("MAIN_SLEEP_MIN", "10")), int(os.getenv("MAIN_SLEEP_MAX", "14"))
+
+# Cutoff times (HH MM)
+CUTOFF_ENTRY_H = int(os.getenv("CUTOFF_ENTRY_H", "23"))
+CUTOFF_ENTRY_M = int(os.getenv("CUTOFF_ENTRY_M", "55"))
+CUTOFF_EXIT_H = int(os.getenv("CUTOFF_EXIT_H", "23"))
+CUTOFF_EXIT_M = int(os.getenv("CUTOFF_EXIT_M", "55"))
+
+TRAIL_OFFSET_SECONDS = int(os.getenv("TRAIL_OFFSET_SECONDS", "90"))  # 1m30s after each 5m boundary
+
+KITE_API_KEY       = os.getenv("KITE_API_KEY", "")
+KITE_ACCESS_TOKEN  = os.getenv("KITE_ACCESS_TOKEN", "")
+CHARTINK_COOKIE    = os.getenv("CHARTINK_COOKIE", "")
+CHARTINK_CSRF      = os.getenv("CHARTINK_CSRF_TOKEN", "")
+FIVEX_CACHE_CSV    = os.path.join(os.path.dirname(__file__), "5x_cache.csv")
+
+# Telegram config
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# New: fixed amount to use per position (INR). If not set, falls back to capital_per_position().
+# Example: export FIXED_POSITION_AMOUNT=20000
+FIXED_POSITION_AMOUNT = float(os.getenv("FIXED_POSITION_AMOUNT", "0") or 0.0)
+
+# Signal de-duplication window (minutes)
+SIGNAL_DEDUP_MINUTES = int(os.getenv("SIGNAL_DEDUP_MINUTES", "40"))
+
+# ==================== State ====================
+broker_positions_today = {}  # {symbol: {"qty","direction","avg_price"}}
+active_slm_orders = defaultdict(list)  # {symbol: [order dicts]}  # diagnostics only
+recent_exits = {}  # {symbol: datetime}
+
+_all_instruments = None
+symbol_to_token = {}
+symbol_to_tick = defaultdict(lambda: 0.05)
+allowed_symbols = set()  # capacity guard
+entry_lock = threading.Lock()
+pending_entries = {}  # {symbol: datetime_added}
+PENDING_TTL_SEC = 180
+
+# Sent signals cache: {(symbol, side): datetime_sent}
+sent_signals = {}
+
+# ==================== Common helpers ====================
+
+def log(msg: str):
+    t = datetime.now(india_tz).strftime("%H:%M:%S")
+    print(f"[{t}] {msg}", flush=True)
+
+
+def now_ist() -> datetime:
+    return datetime.now(india_tz)
+
+
+def before_3pm() -> bool:
+    n = now_ist()
+    return (n.hour, n.minute) < (CUTOFF_ENTRY_H, CUTOFF_ENTRY_M)
+
+
+def exits_allowed_now() -> bool:
+    n = now_ist()
+    return (n.hour, n.minute) < (CUTOFF_EXIT_H, CUTOFF_EXIT_M)
+
+
+def is_trade_allowed(symbol: str) -> bool:
+    last = recent_exits.get(symbol.upper())
+    if not last:
+        return True
+    return (now_ist() - last) >= timedelta(minutes=COOLDOWN_MINUTES)
+
+
+def round_to_tick(price: float, symbol: str) -> float:
+    tick = float(symbol_to_tick.get(symbol.upper(), 0.05) or 0.05)
+    steps = round(price / tick)
+    return round(steps * tick, 2)
+
+# ==================== Kite ====================
+
+kite = KiteConnect(api_key=KITE_API_KEY)
+if KITE_ACCESS_TOKEN:
+    kite.set_access_token(KITE_ACCESS_TOKEN)
+
+# ==================== Hardened HTTP + Kite retry wrapper ====================
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+HARDENED_HTTP = requests.Session()
+retry_cfg = Retry(
+    total=5,
+    backoff_factor=0.4,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET", "POST"]),
+    raise_on_status=False,
+)
+HARDENED_HTTP.mount("https://", HTTPAdapter(max_retries=retry_cfg))
+HARDENED_HTTP.headers.update({"Connection": "close"})
+
+kite_http_lock = threading.Lock()
+
+
+def _retry_jitter(attempt: int) -> float:
+    base = min(0.5 * (2 ** attempt), 4.0)
+    return base + random.uniform(0.0, 0.25)
+
+
+def call_kite(fn, *args, **kwargs):
+    for attempt in range(5):
+        try:
+            with kite_http_lock:
+                return fn(*args, **kwargs)
+        except Exception as e:
+            msg = str(e)
+            transient = (
+                "SSLEOFError" in msg
+                or "UNEXPECTED_EOF_WHILE_READING" in msg
+                or "Max retries exceeded" in msg
+                or "Read timed out" in msg
+                or "Connection aborted" in msg
+                or "RemoteDisconnected" in msg
+            )
+            if transient and attempt < 4:
+                sleep_s = _retry_jitter(attempt)
+                log(f"[kite-retry] {fn.__name__} transient: {msg} → retry {attempt+1}/5 in {sleep_s:.2f}s")
+                time.sleep(sleep_s)
+                continue
+            log(f"[kite-retry] {fn.__name__} failed: {msg}")
+            raise
+
+
+def get_ltp(symbol: str) -> float:
+    try:
+        q = kite.quote(f"NSE:{symbol}")
+        return float(q[f"NSE:{symbol}"]["last_price"])
+    except Exception as e:
+        log(f"[get_ltp] {symbol} {e}")
+        return 0.0
+
+
+def capital_per_position() -> float:
+    # Original behaviour retained as fallback — uses broker margins
+    try:
+        bal = call_kite(kite.margins)["equity"]["available"]["live_balance"]
+        return float(bal) // MAX_POSITIONS if MAX_POSITIONS else 0
+    except Exception as e:
+        log(f"[capital_per_position] {e}")
+        return 0
+
+# New helper: effective capital to use per position (fixed amount if set)
+def effective_capital_per_position() -> float:
+    if FIXED_POSITION_AMOUNT and FIXED_POSITION_AMOUNT > 0:
+        return FIXED_POSITION_AMOUNT
+    return capital_per_position()
+
+# ==================== Instruments ====================
+
+def load_instruments_once():
+    global _all_instruments
+    if _all_instruments is None:
+        log("[init] Loading NSE instruments…")
+        try:
+            _all_instruments = kite.instruments("NSE")
+            for inst in _all_instruments:
+                sym = inst["tradingsymbol"].upper()
+                symbol_to_token[sym] = inst["instrument_token"]
+                symbol_to_tick[sym] = float(inst.get("tick_size", 0.05) or 0.05)
+            log(f"[init] Loaded {len(_all_instruments)} instruments; ticks ready.")
+        except Exception as e:
+            log(f"[init] instruments load failed: {e}")
+            _all_instruments = []
+
+
+def ensure_instrument_token(symbol: str):
+    sym = symbol.upper()
+    tok = symbol_to_token.get(sym)
+    if not tok and _all_instruments is None:
+        load_instruments_once()
+        tok = symbol_to_token.get(sym)
+    if not tok:
+        log(f"[ensure_instrument_token] Not found: {sym}")
+    return tok
+
+# ==================== Broker sync & reconciliation ====================
+
+def fetch_active_positions():
+    out = {}
+    try:
+        data = call_kite(kite.positions).get("day", []) or []
+        for p in data:
+            if p.get("product") != "MIS":
+                continue
+            qty = int(p.get("quantity", 0))
+            if qty == 0:
+                continue
+            sym = p.get("tradingsymbol", "").upper()
+            side = "BUY" if qty > 0 else "SELL"
+            out[sym] = {
+                "qty": abs(qty),
+                "direction": side,
+                "avg_price": float(p.get("average_price", 0.0)),
+            }
+    except Exception as e:
+        log(f"[fetch_active_positions] {e}")
+    return out
+
+
+def _cleanup_pending():
+    now = now_ist()
+    to_del = []
+    for sym, t0 in list(pending_entries.items()):
+        if sym in broker_positions_today:
+            to_del.append(sym)
+        elif (now - t0).total_seconds() > PENDING_TTL_SEC:
+            to_del.append(sym)
+    for sym in to_del:
+        pending_entries.pop(sym, None)
+        if DEBUG:
+            log(f"[pending] cleared: {sym}")
+
+
+def capacity_left() -> int:
+    _cleanup_pending()
+    return max(0, MAX_POSITIONS - (len(broker_positions_today) + len(pending_entries)))
+
+
+def sync_broker_positions_today():
+    broker_positions_today.clear()
+    broker_positions_today.update(fetch_active_positions())
+    log(f"[sync] positions: {list(broker_positions_today.keys()) or 'none'}")
+    _cleanup_pending()
+
+
+def sync_active_orders_cache():
+    # Diagnostics only; trail logic fetches fresh state per symbol.
+    active_slm_orders.clear()
+    try:
+        for o in call_kite(kite.orders) or []:
+            if o.get("product") != "MIS":
+                continue
+            if o.get("variety") != "regular":
+                continue
+            if o.get("status") not in ("TRIGGER PENDING", "OPEN"):
+                continue
+            if o.get("order_type") != "SL-M":
+                continue
+            sym = o.get("tradingsymbol", "").upper()
+            active_slm_orders[sym].append(
+                {
+                    "order_id": o.get("order_id"),
+                    "trigger_price": float(o.get("trigger_price", 0.0) or 0),
+                    "status": o.get("status"),
+                    "transaction_type": o.get("transaction_type"),
+                }
+            )
+        if DEBUG:
+            log("[sync] slms: {sym:len} -> " + str({k: len(v) for k, v in active_slm_orders.items()}))
+    except Exception as e:
+        log(f"[sync_active_orders_cache] {e}")
+
+
+def reconcile_orphan_orders():
+    """Cancel open SL/SL-M orders that do not have a corresponding active MIS position."""
+    try:
+        pos_syms = set(broker_positions_today.keys())
+        for o in call_kite(kite.orders) or []:
+            if o.get("product") != "MIS":
+                continue
+            if o.get("variety") != "regular":
+                continue
+            if o.get("status") not in ("TRIGGER PENDING", "OPEN",                                        "OPEN PENDING", "PUT ORDER REQUEST RECEIVED",                                        "VALIDATION PENDING", "MODIFY VALIDATION PENDING",                                        "MODIFY REQUEST RECEIVED"):
+                continue
+            if o.get("order_type") not in ("SL", "SL-M"):
+                continue
+            sym = o.get("tradingsymbol", "").upper()
+            if sym not in pos_syms:
+                try:
+                    call_kite(kite.cancel_order, variety="regular", order_id=o["order_id"])
+                    log(f"[reconcile] orphan order canceled {sym} oid={o.get('order_id')}")
+                except Exception as ce:
+                    log(f"[reconcile] cancel failed {sym}: {ce}")
+    except Exception as e:
+        log(f"[reconcile] error: {e}")
+
+# ==================== Chartink (signals) ====================
+
+def _parse_cookie_blob(blob):
+    """Handle .env cookie string (dict-style or raw header)."""
+    if not blob:
+        return {}
+    try:
+        return ast.literal_eval(blob)  # if dict-style string
+    except Exception:
+        # fallback: parse "a=1; b=2" format
+        cookies = {}
+        for part in blob.split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                cookies[k.strip()] = v.strip()
+        return cookies
+
+
+def fetch_chartink_signals(scan_type: str, payload: dict):
+    cookies = _parse_cookie_blob(CHARTINK_COOKIE)
+    token = CHARTINK_CSRF or cookies.get("XSRF-TOKEN")
+    if token:
+        token = urllib.parse.unquote(token)
+
+    headers = {
+        "Content-Type": "application/json",
+        "Referer": "https://chartink.com/",
+        "User-Agent": "Mozilla/5.0",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if token:
+        headers["X-XSRF-TOKEN"] = token
+
+    try:
+        r = requests.post(
+            "https://chartink.com/screener/process",
+            headers=headers,
+            json=payload,
+            cookies=cookies,
+            timeout=12,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        if data.get("scan_error"):
+            print(f"[chartink {scan_type}] scan_error: {data['scan_error']}")
+            return []
+
+        syms = [d.get("nsecode", "").upper()
+                for d in data.get("data", [])
+                if isinstance(d, dict) and d.get("nsecode")]
+        return [{"symbol": s, "side": scan_type.upper()} for s in syms]
+
+    except Exception as e:
+        print(f"[chartink {scan_type}] {e}")
+        return []
+
+
+def gather_signals():
+    # Keep your existing scan clauses here (trimmed for brevity)
+    buy_payload  = { "scan_clause": "( ... )" }
+    sell_payload = { "scan_clause": "( ... )" }
+
+    out = []
+    if buy_payload:
+        out += fetch_chartink_signals("BUY", buy_payload)
+    if sell_payload:
+        out += fetch_chartink_signals("SELL", sell_payload)
+
+    # de-dup
+    seen, uniq = set(), []
+    for s in out:
+        key = (s["symbol"], s["side"])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(s)
+
+    # restrict to allowed symbols
+    if allowed_symbols:
+        uniq = [s for s in uniq if s["symbol"].upper() in allowed_symbols]
+    else:
+        log("[signals] allowed_symbols empty — blocking all signals.")
+        uniq = []
+
+    if DEBUG:
+        log(f"[signals] {uniq}")
+    return uniq
+
+# ==================== 5× leverage universe ====================
+
+
+def _save_5x_cache(symbols: set):
+    try:
+        with open(FIVEX_CACHE_CSV, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Symbol"])
+            for s in sorted(symbols):
+                w.writerow([s])
+        log(f"[5x cache] saved {len(symbols)} symbols")
+    except Exception as e:
+        log(f"[5x cache] save failed: {e}")
+
+
+def _load_5x_cache() -> set:
+    if not os.path.exists(FIVEX_CACHE_CSV):
+        return set()
+    try:
+        df = pd.read_csv(FIVEX_CACHE_CSV)
+        s = set(df["Symbol"].str.upper().dropna().tolist())
+        log(f"[5x cache] loaded {len(s)} symbols")
+        return s
+    except Exception as e:
+        log(f"[5x cache] load failed: {e}")
+        return set()
+
+
+def get_5x_leverage_stocks(timeout=25) -> set:
+    url = "https://zerodha.com/margin-calculator/Equity/"
+    symbols = set()
+    driver = None
+    log("[5x] scraping Zerodha Equity margin page…")
+
+    try:
+        chrome_opts = Options()
+        chrome_opts.add_argument("--headless=new")
+        chrome_opts.add_argument("--no-sandbox")
+        chrome_opts.add_argument("--disable-dev-shm-usage")
+        chrome_opts.add_argument("--disable-gpu")
+        chrome_opts.add_argument("--window-size=1280,800")
+        service = ChromeService(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_opts)
+        driver.set_page_load_timeout(timeout)
+        driver.get(url)
+        time.sleep(5)
+        page = driver.page_source
+    except Exception as e:
+        log(f"[5x] scrape failed: {e}")
+        page = ""
+    finally:
+        try:
+            if driver:
+                driver.quit()
+        except Exception:
+            pass
+
+    if not page:
+        return set()
+
+    try:
+        soup = BeautifulSoup(page, "html.parser")
+        rows = soup.select("table tbody tr")
+        for row in rows:
+            tds = row.find_all("td")
+            if len(tds) >= 3:
+                sym = (tds[0].get_text() or "").strip().upper()
+                mis_lev = (tds[2].get_text() or "").strip().lower()
+                try:
+                    lev = float(mis_lev.replace("x", "").strip())
+                    if lev == 5.0 and sym:
+                        symbols.add(sym)
+                except Exception:
+                    continue
+        log(f"[5x] scraped {len(symbols)} symbols with 5x leverage")
+    except Exception as e:
+        log(f"[5x] parse failed: {e}")
+        return set()
+
+    return symbols
+
+
+def load_allowed_symbols_5x():
+    global allowed_symbols
+    live = get_5x_leverage_stocks()
+    if live:
+        allowed_symbols = live
+        _save_5x_cache(live)
+        sample = sorted(list(allowed_symbols))[:20]
+        log(f"[5x] LIVE set applied ({len(live)}). Sample: {sample}…")
+        return
+    cached = _load_5x_cache()
+    if cached:
+        allowed_symbols = cached
+        log(f"[5x] Using CACHE set ({len(cached)})")
+        return
+    allowed_symbols = set()
+    log("[5x] EMPTY — entries blocked until list is available")
+
+# ==================== 5m candle helpers ====================
+
+def _five_minute_bounds_for_fetch(now=None, n_candles=5):
+    if now is None:
+        now = now_ist()
+    minute_block = (now.minute // 5) * 5
+    current_window_start = now.replace(minute=minute_block, second=0, microsecond=0)
+    to_ts = current_window_start
+    from_ts = to_ts - timedelta(minutes=5 * n_candles)
+    return from_ts, to_ts
+
+
+def get_last_n_five_min_candles(symbol: str, n: int = 5):
+    symbol = symbol.upper()
+    token = ensure_instrument_token(symbol)
+    if not token:
+        log(f"[get_last_n_five_min_candles] No token for {symbol}")
+        return []
+
+    from_ts, to_ts = _five_minute_bounds_for_fetch(now_ist(), n)
+    url = f"https://api.kite.trade/instruments/historical/{token}/5minute"
+    params = {"from": from_ts.strftime("%Y-%m-%d %H:%M:%S"), "to": to_ts.strftime("%Y-%m-%d %H:%M:%S"), "oi": 0}
+    headers = {"X-Kite-Version": "3", "Authorization": f"token {KITE_API_KEY}:{KITE_ACCESS_TOKEN}"}
+
+    for attempt in range(2):
+        try:
+            r = HARDENED_HTTP.get(url, headers=headers, params=params, timeout=5)
+            r.raise_for_status()
+            candles = r.json().get("data", {}).get("candles", []) or []
+            candles = candles[-max(1, n):]
+            out = []
+            for row in candles:
+                ts, o, h, l, c, v = row
+                out.append({"ts": ts, "open": float(o), "high": float(h), "low": float(l), "close": float(c), "volume": float(v)})
+            if DEBUG:
+                log(f"[candles] {symbol} last{n}: {out}")
+            return out
+        except Exception as e:
+            log(f"[get_last_n_five_min_candles] {symbol} attempt {attempt+1} {e}")
+            time.sleep(0.8)
+    return []
+
+
+def get_last_completed_5m_candle(symbol: str):
+    """Return the *previous* fully closed 5m candle (off-by-one safe)."""
+    c = get_last_n_five_min_candles(symbol, n=2)
+    if not c:
+        return None
+    if len(c) == 1:
+        return c[0]
+    return c[-1]
+
+
+def compute_sl_and_meta(symbol: str, direction: str):
+    """
+    Returns (trigger_price, last_candle_dict)
+    last_candle_dict: {"ts", "open","high","low","close","volume"} or None
+    """
+    last = get_last_completed_5m_candle(symbol)
+    if not last:
+        return None, None
+    raw = last["low"] if direction.upper() == "BUY" else last["high"]
+    trig = round_to_tick(raw, symbol)
+    if DEBUG:
+        log(f"[sl-prev] {symbol} dir={direction} using {last['ts']} -> {trig}")
+    return trig, last
+
+# ==================== Orders ====================
+
+def place_slm_order(symbol, direction, qty, trigger_price):
+    if not exits_allowed_now():
+        log(f"[place_slm_order] Skipped after 15:00 for {symbol}")
+        return None
+    symbol = symbol.upper()
+    trigger_price = round_to_tick(trigger_price, symbol)
+    if SIMULATION_MODE:
+        log(f"[SIM SLM] {symbol} {direction} qty={qty} trig={trigger_price}")
+        return f"SIM_SLM_{symbol}"
+    try:
+        trans = "SELL" if direction.upper() == "BUY" else "BUY"
+        oid = call_kite(
+            kite.place_order,
+            tradingsymbol=symbol,
+            exchange="NSE",
+            transaction_type=trans,
+            quantity=qty,
+            order_type="SL-M",
+            trigger_price=trigger_price,
+            price=0,
+            product="MIS",
+            variety="regular",
+        )
+        log(f"[place_slm_order] {symbol} oid={oid} trig={trigger_price}")
+        return oid
+    except Exception as e:
+        log(f"[place_slm_order] {symbol} {e}")
+        return None
+
+
+def modify_sl_order(order_id, new_trigger, symbol, max_retries: int = 4) -> bool:
+    if not exits_allowed_now():
+        log(f"[modify_sl_order] Skipped after 15:00 for {symbol}")
+        return False
+    new_trigger = round_to_tick(new_trigger, symbol)
+    if SIMULATION_MODE:
+        log(f"[SIM MODIFY] {symbol} -> {new_trigger}")
+        return True
+
+    for attempt in range(max_retries):
+        try:
+            call_kite(kite.modify_order, variety="regular", order_id=order_id, trigger_price=new_trigger)
+            log(f"[modify_sl_order] {symbol} -> {new_trigger} (ok)")
+            return True
+        except Exception as e:
+            msg = str(e)
+            sleep_s = _retry_jitter(attempt)
+            log(f"[modify_sl_order] {symbol} attempt {attempt+1}/{max_retries} failed: {msg} → retry in {sleep_s:.2f}s")
+            time.sleep(sleep_s)
+
+    log(f"[modify_sl_order] {symbol} giving up after {max_retries} attempts")
+    return False
+
+
+def cancel_all_open_orders_for_symbol(symbol):
+    if not exits_allowed_now():
+        log(f"[cancel_all_open_orders_for_symbol] Skipped after 15:00 for {symbol}")
+        return
+    try:
+        for o in call_kite(kite.orders) or []:
+            if o.get("product") != "MIS":
+                continue
+            if o.get("variety") != "regular":
+                continue
+            if o.get("status") not in ("TRIGGER PENDING", "OPEN",                                        "OPEN PENDING", "PUT ORDER REQUEST RECEIVED",                                        "VALIDATION PENDING", "MODIFY VALIDATION PENDING",                                        "MODIFY REQUEST RECEIVED"):
+                continue
+            if o.get("tradingsymbol", "").upper() != symbol.upper():
+                continue
+            if o.get("order_type") not in ("SL", "SL-M"):
+                continue
+            try:
+                call_kite(kite.cancel_order, variety="regular", order_id=o["order_id"])
+                log(f"[cancel] {symbol} order {o.get('order_id')}")
+            except Exception as e:
+                log(f"[cancel] {symbol} {e}")
+    except Exception as e:
+        log(f"[cancel_all_open_orders_for_symbol] {e}")
+
+
+def close_position_market(symbol: str, pos: dict):
+    if not exits_allowed_now():
+        log(f"[close_position_market] Skipped after 15:00 for {symbol}")
+        return None
+    symbol = symbol.upper()
+    trans = "SELL" if pos["direction"].upper() == "BUY" else "BUY"
+    qty = int(pos.get("qty", 0) or 0)
+    if qty <= 0:
+        return None
+    if SIMULATION_MODE:
+        log(f"[SIM EXIT] {symbol} {trans} x{qty} @ MARKET")
+        cancel_all_open_orders_for_symbol(symbol)
+        recent_exits[symbol] = now_ist()
+        return "SIM_EXIT"
+    try:
+        oid = call_kite(
+            kite.place_order,
+            tradingsymbol=symbol,
+            exchange="NSE",
+            transaction_type=trans,
+            quantity=qty,
+            order_type="MARKET",
+            product="MIS",
+            variety="regular",
+        )
+        log(f"[exit] {symbol} market-exit placed: {oid}")
+        cancel_all_open_orders_for_symbol(symbol)
+        recent_exits[symbol] = now_ist()
+        return oid
+    except Exception as e:
+        log(f"[close_position_market] {symbol} {e}")
+        return None
+
+# -------------------- NEW: robust SL-M fetch + update/replace --------------------
+
+
+def side_to_exit_trans(position_direction: str) -> str:
+    """For a BUY position you must have a SELL SL-M, and vice versa."""
+    return "SELL" if position_direction.upper() == "BUY" else "BUY"
+
+
+def fetch_symbol_slm_from_broker(symbol: str, expected_trans: str):
+    """
+    Pull a fresh view of the symbol's working SL-M order (matching transaction_type).
+    Includes transient states that appear during put/modify flows.
+    Returns the most recent matching order if multiple candidates exist.
+    """
+    ACCEPTABLE_STATUSES = {
+        "OPEN",
+        "TRIGGER PENDING",
+        "PUT ORDER REQUEST RECEIVED",
+        "MODIFY VALIDATION PENDING",
+        "MODIFY REQUEST RECEIVED",
+        "OPEN PENDING",
+        "VALIDATION PENDING",
+    }
+    best = None
+    try:
+        for o in call_kite(kite.orders) or []:
+            if o.get("product") != "MIS":
+                continue
+            if o.get("variety") != "regular":
+                continue
+            if o.get("order_type") != "SL-M":
+                continue
+            if o.get("tradingsymbol", "").upper() != symbol.upper():
+                continue
+            if o.get("transaction_type") != expected_trans:
+                continue
+            if o.get("status") not in ACCEPTABLE_STATUSES:
+                continue
+            cur = {
+                "order_id": o.get("order_id"),
+                "trigger_price": float(o.get("trigger_price") or 0.0),
+                "status": o.get("status"),
+                "transaction_type": o.get("transaction_type"),
+                "updated_at": o.get("updated_at") or o.get("order_timestamp"),
+            }
+            if not best or str(cur.get("updated_at", "")) > str(best.get("updated_at", "")):
+                best = cur
+    except Exception as e:
+        log(f"[fetch_symbol_slm_from_broker] {symbol} {e}")
+    return best
+
+
+def update_or_replace_slm(symbol: str, pos: dict, new_trig: float) -> str:
+    """
+    Ensure there's exactly one correct SL-M:      
+    * Try fetch → modify.      
+    * If fetch fails or modify fails, cancel any open working SL/SL-M for this symbol & side,
+      then place a fresh SL-M with new_trig.
+    Returns an action string for diagnostics: 'MODIFIED', 'REPLACED', 'ENSURED', 'FAILED', 'SKIPPED-AFTER-CUTOFF'
+    """
+    if not exits_allowed_now():
+        return "SKIPPED-AFTER-CUTOFF"
+
+    expected_trans = side_to_exit_trans(pos["direction"])
+
+    slm = fetch_symbol_slm_from_broker(symbol, expected_trans)
+
+    if slm:
+        ok = modify_sl_order(slm["order_id"], new_trig, symbol)
+        if ok:
+            return "MODIFIED"
+        # modify failed after retries → cancel+recreate
+
+    # Cancel any stale/stray orders for this symbol that match expected SL types
+    try:
+        for o in call_kite(kite.orders) or []:
+            if o.get("product") != "MIS":
+                continue
+            if o.get("variety") != "regular":
+                continue
+            if o.get("tradingsymbol", "").upper() != symbol.upper():
+                continue
+            if o.get("status") not in ("OPEN", "TRIGGER PENDING", "OPEN PENDING",                                        "PUT ORDER REQUEST RECEIVED", "VALIDATION PENDING",                                        "MODIFY VALIDATION PENDING", "MODIFY REQUEST RECEIVED"):
+                continue
+            if o.get("order_type") not in ("SL", "SL-M"):
+                continue
+            if o.get("transaction_type") != expected_trans:
+                continue
+            try:
+                call_kite(kite.cancel_order, variety="regular", order_id=o["order_id"])
+                log(f"[update_or_replace] {symbol} canceled stale SL oid={o.get('order_id')}")
+            except Exception as ce:
+                log(f"[update_or_replace] {symbol} cancel failed: {ce}")
+    except Exception as e:
+        log(f"[update_or_replace] {symbol} list/cancel error: {e}")
+
+    # Place a fresh SL-M
+    oid = place_slm_order(symbol, pos["direction"], pos["qty"], new_trig)
+    return "REPLACED" if oid else "FAILED"
+
+# ==================== Entries (modified: notify only) ====================
+
+def send_telegram(text: str) -> bool:
+    """Send a Telegram message via bot. Returns True on success."""
+    token = TELEGRAM_BOT_TOKEN
+    chat_id = TELEGRAM_CHAT_ID
+    if not token or not chat_id:
+        log("[telegram] token/chat_id not configured; cannot send message")
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    try:
+        r = requests.post(url, json=payload, timeout=8)
+        if r.status_code == 200:
+            j = r.json()
+            ok = j.get("ok", False)
+            if not ok:
+                log(f"[telegram] response not ok: {j}")
+            return ok
+        else:
+            log(f"[telegram] send failed HTTP {r.status_code}: {r.text}")
+            return False
+    except Exception as e:
+        log(f"[telegram] send error: {e}")
+        return False
+
+
+def place_market_entry(symbol, side):
+    """Do NOT place a market order automatically.
+
+    Instead: compute suggested qty using FIXED_POSITION_AMOUNT (if set) or
+    effective_capital_per_position(); apply 5× leverage for qty calculation.
+    Reserve a pending slot and notify the user on Telegram with symbol, side,
+    qty, ltp and previous-candle-trigger. The user will place the order manually.
+    The bot will detect the manual position on the next sync and will manage
+    SL-M orders and trailing as before.
+
+    Signals are de-duplicated per (symbol, side) for SIGNAL_DEDUP_MINUTES.
+    """
+    sym = symbol.upper()
+    now = now_ist()
+    with entry_lock:
+        # Basic gating
+        if not before_3pm():
+            log(f"[entry] Skipped after 15:00: {sym}")
+            return None
+        if not allowed_symbols or sym not in allowed_symbols:
+            log(f"[entry] {sym} not in 5x universe — blocked.")
+            return None
+        if not is_trade_allowed(sym):
+            log(f"[entry] {sym} on cooldown — blocked.")
+            return None
+        if sym in broker_positions_today or sym in pending_entries:
+            log(f"[entry] {sym} already active/pending — skipped.")
+            return None
+        if capacity_left() <= 0:
+            log(f"[entry] capacity reached ({MAX_POSITIONS}) — skipped.")
+            return None
+
+        # De-dup: same (symbol, side) within SIGNAL_DEDUP_MINUTES
+        key = (sym, side.upper())
+        last_sent = sent_signals.get(key)
+        if last_sent and (now - last_sent) < timedelta(minutes=SIGNAL_DEDUP_MINUTES):
+            log(f"[entry] {sym} {side} signal suppressed (dedupe {SIGNAL_DEDUP_MINUTES}m).")
+            return None
+
+        ltp_before = get_ltp(sym)
+        if ltp_before <= 0:
+            log(f"[entry] {sym} LTP unavailable — skipped.")
+            return None
+
+        # --- compute prev candle SL for reference ---
+        trig, last = compute_sl_and_meta(sym, side)
+        if not trig or not last:
+            log(f"[entry] {sym} cannot compute prev candle — skipped.")
+            return None
+
+        gap_pct = abs((ltp_before - trig) / trig) * 100
+        if side.upper() == "BUY" and ltp_before < trig:
+            log(f"[entry] {sym} LTP below prev low — skipped.")
+            return None
+        if side.upper() == "SELL" and ltp_before > trig:
+            log(f"[entry] {sym} LTP above prev high — skipped.")
+            return None
+        if gap_pct > 4.3:
+            log(f"[entry] {sym} gap {gap_pct:.2f}% > 4.3% — skipped.")
+            return None
+
+        # Quantity calculation: use FIXED_POSITION_AMOUNT when set, else effective_capital_per_position()
+        cap = effective_capital_per_position()
+        if cap <= 0:
+            log(f"[entry] {sym} capital_per_position <=0 — skipped.")
+            return None
+        # Apply 5x leverage (universe is 5x eligible)
+        leveraged_cap = cap * 5
+        qty = int(leveraged_cap // ltp_before)
+        if qty <= 0:
+            log(f"[entry] {sym} qty calc <= 0 — skipped.")
+            return None
+
+        # Reserve slot to avoid duplicate notifications
+        pending_entries[sym] = now_ist()
+        sent_signals[key] = now_ist()
+
+    # Build telegram message (outside lock)
+    last_ts = last["ts"] if last else "NA"
+    msg = (
+        f"{side} SIGNAL: {sym}\n"
+        f"Suggested qty: {qty}\n"
+        f"LTP: {ltp_before}\n"
+        f"Prev-5m-ts: {last_ts}\n"
+        f"Prev-extreme-trig: {trig}\n\n"
+        "ACTION: Place MARKET (MIS) manually for this symbol.\n"
+        "Once you place the order, the bot will detect it and will ensure/create/update SL-M and trailing SLs."
+    )
+
+    ok = send_telegram(msg)
+    log(f"[entry-notify] {sym} {side} qty={qty} notified={ok}")
+    return "NOTIFIED" if ok else None
+
+# ==================== SL ensure & BREACH-or-UPDATE trailing ====================
+
+def _fallback_sl(symbol, direction):
+    ltp = get_ltp(symbol)
+    if ltp <= 0:
+        return None
+    raw = ltp * (1 - 0.00003) if direction.upper() == "BUY" else ltp * (1 + 0.00003)
+    trig = round_to_tick(raw, symbol)
+    log(f"[fallback-sl] {symbol} -> {trig}")
+    return trig
+
+
+def ensure_slm_exists_for_position(symbol, pos):
+    """
+    Ensure there's exactly one SL-M for the position (matching side).
+    If missing, create using previous closed 5m candle extreme (or fallback).
+    """
+    expected_trans = side_to_exit_trans(pos["direction"])
+    existing = fetch_symbol_slm_from_broker(symbol, expected_trans)
+    if existing:
+        return  # already have a matching SL-M
+
+    trig, _last = compute_sl_and_meta(symbol, pos["direction"])
+    if not trig:
+        trig = _fallback_sl(symbol, pos["direction"])
+    if trig:
+        log(f"[ensure-sl] creating SL-M {symbol} -> {trig}")
+        place_slm_order(symbol, pos["direction"], pos["qty"], trig)
+
+
+def trail_slm_positions():
+    """
+    For every active MIS position:      
+    1) Compute new_trig from previous closed 5m candle (LOW for BUY, HIGH for SELL)      
+    2) If price has already breached new_trig → immediate market exit      
+    3) Else ensure/update/replace SL-M so the live SL equals new_trig
+    Also cancels orphans beforehand.
+
+    Prints a per-symbol diagnostic line:
+      [diag] SYMBOL dir=BUY prev_ts=YYYY-mm-ddTHH:MM:SS trig=123.45 ltp=123.80 action=MODIFIED
+    """
+    reconcile_orphan_orders()
+
+    positions_snapshot = dict(broker_positions_today)
+
+    for symbol, pos in positions_snapshot.items():
+        direction = pos["direction"]
+        new_trig, last = compute_sl_and_meta(symbol, direction)
+        last_ts = last["ts"] if last else "NA"
+        if not new_trig:
+            new_trig = _fallback_sl(symbol, direction)
+
+        ltp = get_ltp(symbol)
+        if ltp <= 0:
+            log(f"[diag] {symbol} dir={direction} prev_ts={last_ts} trig={new_trig} ltp=NA action=SKIP-NOLTP")
+            continue
+
+        breached = (direction.upper() == "BUY" and ltp <= new_trig) or \
+                    (direction.upper() == "SELL" and ltp >= new_trig)
+        if breached and exits_allowed_now():
+            close_position_market(symbol, pos)
+            log(f"[diag] {symbol} dir={direction} prev_ts={last_ts} trig={new_trig} ltp={ltp} action=EXITED")
+            continue
+
+        if exits_allowed_now():
+            act = update_or_replace_slm(symbol, pos, new_trig)
+            log(f"[diag] {symbol} dir={direction} prev_ts={last_ts} trig={new_trig} ltp={ltp} action={act}")
+        else:
+            log(f"[diag] {symbol} dir={direction} prev_ts={last_ts} trig={new_trig} ltp={ltp} action=SKIPPED-AFTER-CUTOFF")
+
+# ==================== Scheduler ====================
+
+def _next_tick_time(now=None, offset_seconds=TRAIL_OFFSET_SECONDS):
+    if now is None:
+        now = now_ist()
+    minute_block = (now.minute // 5) * 5
+    base = now.replace(minute=minute_block, second=0, microsecond=0)
+    candidate = base + timedelta(minutes=5, seconds=offset_seconds)
+    while candidate <= now:
+        candidate += timedelta(minutes=5)
+    return candidate
+
+
+def do_trailing_cycle(prev_snapshot):
+    curr = fetch_active_positions()
+    sync_broker_positions_today()
+    sync_active_orders_cache()
+    detect_manual_exits_and_cleanup(prev_snapshot if prev_snapshot else {}, curr)
+    trail_slm_positions()
+    return curr
+
+_prev_snapshot = {}
+
+def detect_manual_exits_and_cleanup(prev_snapshot, curr_snapshot):
+    prev_syms = set(prev_snapshot.keys())
+    curr_syms = set(curr_snapshot.keys())
+    exited = prev_syms - curr_syms
+    for sym in exited:
+        if exits_allowed_now():
+            cancel_all_open_orders_for_symbol(sym)
+        recent_exits[sym] = now_ist()
+        pending_entries.pop(sym, None)
+        log(f"[cooldown] {sym} exit observed → cooldown starts")
+
+
+def start_trailing_scheduler():
+    def scheduler_loop():
+        global _prev_snapshot
+        log("[scheduler] immediate cycle start")
+        _prev_snapshot = do_trailing_cycle(_prev_snapshot)
+        while True:
+            n = now_ist()
+            if (n.hour, n.minute) >= (CUTOFF_EXIT_H, CUTOFF_EXIT_M):
+                log("[scheduler] 15:00 reached — stopping scheduler.")
+                break
+            next_wake = _next_tick_time(n, offset_seconds=TRAIL_OFFSET_SECONDS)
+            sleep_s = max(0, int((next_wake - n).total_seconds()))
+            log(f"[scheduler] sleeping {sleep_s}s → next {next_wake.strftime('%H:%M:%S')}")
+            time.sleep(sleep_s)
+
+            log("[scheduler] wake → cycle")
+            _prev_snapshot = do_trailing_cycle(_prev_snapshot)
+
+    t = threading.Thread(target=scheduler_loop, daemon=True)
+    t.start()
+    return t
+
+# ==================== Main loop ====================
+
+def main_loop():
+    global _prev_snapshot
+    log("[main] starting bot (local verbose)…")
+    load_instruments_once()
+    load_allowed_symbols_5x()
+
+    _prev_snapshot = fetch_active_positions()
+    sync_broker_positions_today()
+    sync_active_orders_cache()
+
+    start_trailing_scheduler()
+
+    while True:
+        n = now_ist()
+        if (n.hour, n.minute) >= (CUTOFF_EXIT_H, CUTOFF_EXIT_M):
+            log("[main] 15:00 reached — stopping bot.")
+            break
+
+        curr = fetch_active_positions()
+        sync_broker_positions_today()
+        sync_active_orders_cache()
+        detect_manual_exits_and_cleanup(_prev_snapshot, curr)
+        _prev_snapshot = curr
+
+        if exits_allowed_now():
+            for sym, pos in dict(broker_positions_today).items():
+                ensure_slm_exists_for_position(sym, pos)
+
+        if before_3pm():
+            sigs = gather_signals()
+            for sig in sigs:
+                if capacity_left() <= 0:
+                    log("[entry] capacity full — skipping remaining signals this cycle")
+                    break
+                place_market_entry(sig["symbol"], sig["side"])
+
+        sleep_for = random.randint(MAIN_SLEEP_MIN, MAIN_SLEEP_MAX)
+        log(f"[main] sleep {sleep_for}s")
+        time.sleep(sleep_for)
+
+if __name__ == "__main__":
+    main_loop()
